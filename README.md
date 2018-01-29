@@ -1,4 +1,4 @@
-# Gamalon Interview Problem
+# Raft Interview Problem
 
 ## Summary
 
