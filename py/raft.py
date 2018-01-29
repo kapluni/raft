@@ -38,11 +38,12 @@ class NodeState:
         # candidateId that received vote in current term (or None if none)
         self.d['votedFor'] = None
         # log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
-        self.d['log'] = []
+        self.d['log'] = {}
         # index of highest log entry known to be committed (initialized to 0, increases monotonically)
         self.commitIndex = 0
         # index of highest log entry applied to state machine (initialized to 0, increases monotonically)
         self.lastApplied = 0
+        self.uncommittedEntries = {}
 
     def currentTerm(self):
         return self.d['currentTerm']
@@ -78,11 +79,24 @@ class NodeState:
         return len(self.d['log'])
 
     def term(self):
+        # not sure i need this
         if self.d['log']:
             return self.d['log'][-1]['term']
         else:
             return 0
 
+    def add_new_entry(self,entry):
+        newEntryIndex = self.lastApplied + 1
+        entry['term'] = self.currentTerm()
+        self.uncommittedEntries[newEntryIndex] = entry
+        self.lastApplied = newEntryIndex
+        return {newEntryIndex: entry}
+
+    def commit_entry(self,index):
+        if self.commitIndex < index:
+            self.commitIndex = index
+        self.d['log'][index] = self.uncommittedEntries[index]
+        self.d.sync()
 
     def appendEntries(self, term, entries):
         # If an existing entry conflicts with a new one (same index
@@ -90,7 +104,9 @@ class NodeState:
         # follow it (§5.3)
 
         # Append any new entries not already in the log
-        self.d['log']
+        for entry in entries:
+            id, value = entry.popitem()
+            self.d['log'][id] = value
         self.d.sync()
 
 
@@ -136,10 +152,11 @@ class Node:
 
     def become_leader(self, e):
         print("============= BECOME LEADER =============")
+        print(self.ownAddress)
         # • Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server
         if self.electionTimer:
             self.electionTimer.remove()
-        self.heartbeat = scheduler.add_job(n.append_entries_send, 'interval', seconds=2, max_instances=1)
+        self.heartbeat = scheduler.add_job(n.append_entries_send, 'interval', seconds=2, max_instances=5)
 
     def stop_being_leader(self, e):
         print("============= STOP BEING LEADER =============")
@@ -148,7 +165,7 @@ class Node:
 
     def become_follower(self, e):
         print("============= BECOME FOLLOWER =============")
-        self.electionTimer = scheduler.add_job(self.election_timer_timeout,'interval',seconds=self.electionTimerInterval, max_instances=1)
+        self.electionTimer = scheduler.add_job(self.election_timer_timeout,'interval',seconds=self.electionTimerInterval, max_instances=5)
 
     def initialize_clients(self):
         print("Initiailizing Clients")
@@ -173,7 +190,8 @@ class Node:
             ns.setCurrentTerm(term)
         if ns.checkPrevLog(prevLogIndex,prevLogTerm):
             return ns.currentTerm(), False
-        if entries != None:
+        if entries:
+            print("APPENDING ENTRIES {}".format(entries))
             ns.appendEntries(term, entries)
         if leaderCommit > ns.commitIndex:
             ns.commitIndex = min(leaderCommit, entries.last['index'])
@@ -200,9 +218,8 @@ class Node:
     # leader methods
 
     # @asyncio.coroutine
-    def append_entries_send(self):
+    def append_entries_send(self,entries = []):
         ns = self.ns
-        entries = []
         if self.serverState.isstate('leader'):
             maxTerm=ns.currentTerm()
             for c in self.clients.values():
@@ -244,6 +261,13 @@ class Node:
             votes_for_current_round[id] = {'term': term, 'granted': granted }
         print(votes_for_current_round)
         return votes_for_current_round
+
+    def leader_add_entry(self, entry):
+        print("============= LEADER ADD ENTRY =============")
+        if self.serverState.isstate('leader'):
+            self.append_entries_send([self.ns.add_new_entry(eval(entry))])
+        else:
+            return False, leaderId
 
 logging.basicConfig(stream=sys.stdout, level=logging.WARN)
 
