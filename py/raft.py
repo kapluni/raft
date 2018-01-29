@@ -48,7 +48,12 @@ class NodeState:
         return self.d['currentTerm']
 
     def incrementCurrentTerm(self):
-        self.d['currentTerm'] = self.d['currentTerm'] + 1
+        self.setCurrentTerm(self.d['currentTerm'] + 1)
+
+    def setCurrentTerm(self,currentTerm):
+        self.d['currentTerm'] = currentTerm
+        self.d.sync()
+        print("Current term set to {}".format(self.d['currentTerm']))
 
     def voteFor(self, candidateId):
         self.d['votedFor'] = candidateId
@@ -91,11 +96,11 @@ class NodeState:
 
 class Node:
 
-    nodesInCluster=3
+    nodesInCluster=5
 
     # def __init__(self, nodeAddresses):
     def __init__(self):
-        self.electionTimerInterval=10 #seconds timeout
+        self.electionTimerInterval=randint(6,10) #seconds timeout
         # self.electionTimerInterval=randint(2,5) #seconds timeout
         self.ns = NodeState()
         self.ownAddress = socket.gethostbyname(socket.gethostname())
@@ -132,9 +137,9 @@ class Node:
     def become_leader(self, e):
         print("============= BECOME LEADER =============")
         # • Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server
-        self.heartbeat = scheduler.add_job(n.append_entries_send, 'interval', seconds=5)
         if self.electionTimer:
             self.electionTimer.remove()
+        self.heartbeat = scheduler.add_job(n.append_entries_send, 'interval', seconds=2, max_instances=1)
 
     def stop_being_leader(self, e):
         print("============= STOP BEING LEADER =============")
@@ -143,7 +148,7 @@ class Node:
 
     def become_follower(self, e):
         print("============= BECOME FOLLOWER =============")
-        self.electionTimer = scheduler.add_job(self.election_timer_timeout,'interval',seconds=self.electionTimerInterval)
+        self.electionTimer = scheduler.add_job(self.election_timer_timeout,'interval',seconds=self.electionTimerInterval, max_instances=1)
 
     def initialize_clients(self):
         print("Initiailizing Clients")
@@ -158,19 +163,21 @@ class Node:
         self.nodeAddresses = socket.gethostbyname_ex('raft')[2]
 
     def append_entries(self, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit):
-        print("APPEND ENTRIES")
         ns = self.ns
         if self.serverState.isstate('candidate'):
             self.serverState.discoverLeader()
             self.leaderId = leaderId
         if term < ns.currentTerm():
             return ns.currentTerm(), False
-        elif ns.checkPrevLog(prevLogIndex,prevLogTerm):
+        elif term > ns.currentTerm():
+            ns.setCurrentTerm(term)
+        if ns.checkPrevLog(prevLogIndex,prevLogTerm):
             return ns.currentTerm(), False
         if entries != None:
             ns.appendEntries(term, entries)
         if leaderCommit > ns.commitIndex:
             ns.commitIndex = min(leaderCommit, entries.last['index'])
+        return term, True
 
     def request_vote(self, term, candidateId, lastLogIndex, lastLogTerm):
         print("REQUEST VOTE")
@@ -183,21 +190,27 @@ class Node:
             granted = True
         else:
             granted = False
+        if term > ns.currentTerm():
+            ns.setCurrentTerm(term)
         return term, granted
 
     def election_timer_timeout(self):
-        print("ELECTION TIMER TIMEOUT")
         if self.leaderId == None and self.serverState.isstate('follower'):
             self.serverState.startElection()
     # leader methods
 
     # @asyncio.coroutine
     def append_entries_send(self):
-        print("APPEND ENTRIES SEND")
         ns = self.ns
         entries = []
-        for c in self.clients.values():
-            c.append_entries(ns.currentTerm(), self.ownAddress, ns.index(), ns.currentTerm(), entries, ns.commitIndex)
+        if self.serverState.isstate('leader'):
+            maxTerm=ns.currentTerm()
+            for c in self.clients.values():
+                term, success = c.append_entries(ns.currentTerm(), self.ownAddress, ns.index(), ns.currentTerm(), entries, ns.commitIndex)
+                maxTerm = max(maxTerm,term)
+            if maxTerm > ns.currentTerm():
+                ns.setCurrentTerm(maxTerm)
+                self.serverState.discoverServerWithHigherTerm()
 
         # result = yield from protocol.append_entries_receive((self.nodeAddresses[0], 1234), ns.currentTerm(), self.ownAddress, prevLogIndex, prevLogTerm, entries, leaderCommit)
         # print(result[1] if result[0] else "No response received")
@@ -209,12 +222,15 @@ class Node:
         ns.incrementCurrentTerm()
         votes_for_current_round = self.request_vote_send()
         yesVotes = len([a for a in votes_for_current_round.values() if a['granted']==True]) + 1 # add 1 for self
+        maxTerm = max([a['term'] for a in votes_for_current_round.values()])
+        if maxTerm > ns.currentTerm():
+            ns.setCurrentTerm(maxTerm)
         if yesVotes > self.nodesInCluster / 2:
             self.serverState.receivedMajority()
         elif self.leaderId != None and not(self.serverState.isstate('follower')):
             self.serverState.discoverLeader()
         else:
-            print(self.serverState)
+            print(self.serverState.current)
 
 
     def request_vote_send(self):
@@ -223,8 +239,10 @@ class Node:
         votes_for_current_round = {}
         # would be good to do this in parallel eventually
         for id, client in self.clients.items():
+            print("Request vote from {}".format(id))
             term, granted = client.request_vote(ns.currentTerm(), self.ownAddress, ns.index(), ns.term())
             votes_for_current_round[id] = {'term': term, 'granted': granted }
+        print(votes_for_current_round)
         return votes_for_current_round
 
 logging.basicConfig(stream=sys.stdout, level=logging.WARN)
